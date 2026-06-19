@@ -1,6 +1,6 @@
 id=local_mcp_bridge
 name=Local MCP File Bridge
-version=v0.2
-versionCode=2
+version=v0.2.1
+versionCode=3
 author=GreenTeodoro839
 description=Local MCP server on 127.0.0.1:8765 that bridges phone files to/from the remote sandbox (push_file/pull_file). Native Android build (GOOS=android), uses the OS DNS + CA store.

@@ -35,7 +35,7 @@
    ```
    Authorization: Bearer 1a2b3c...（64 位十六进制）
    ```
-   记下它（也可稍后用 `su -c 'cat /data/adb/local_mcp_bridge/token'` 再看）。
+   记下它（也可稍后用 `su -c 'cat /data/adb/modules/local_mcp_bridge/token'` 再看）。
 4. 重启手机，桥接器会随开机启动，监听 `http://127.0.0.1:8765/mcp`。
 5. 在 Miclaw 里**再加一个 URL 型 MCP 服务器**。Miclaw 一次只能加一个 server，直接粘贴下面这条，把 `<BRIDGE_TOKEN>` 换成第 3 步那个 token：
 
@@ -56,10 +56,11 @@
 
 ## Token 是怎么来的
 
-- 模块安装时（`customize.sh`）自动生成一个随机 token（两段内核 UUID 拼成 64 位十六进制，不依赖额外工具），存到 `/data/adb/local_mcp_bridge/token`（仅 root 可读，`0600`）。
-- 该路径在**模块目录之外**，所以更新/重装模块**不会**丢 token。
+- 模块安装时（`customize.sh`）自动生成一个随机 token（两段内核 UUID 拼成 64 位十六进制，不依赖额外工具），存到**模块目录内** `/data/adb/modules/local_mcp_bridge/token`（仅 root 可读，`0600`）。
+- 放在模块目录内的好处：**卸载模块时会随模块目录一起删除，不留残留**。
+- 更新模块时模块目录会被新版替换，但 `customize.sh` 会把旧版的 token 拷贝过来，所以**更新后 token 不变**，无需重新粘贴到 Miclaw。
 - 开机脚本 `service.sh` 从该文件读出 token，以 `BRIDGE_TOKEN` 环境变量传给桥接器；若文件意外缺失会在开机时补生成，保证鉴权始终开启。
-- 想换新 token：删掉该文件再重装模块（或重启）即可重新生成，记得同步更新 Miclaw 里的请求头。
+- 想换新 token：删掉该文件再重启即可重新生成，记得同步更新 Miclaw 里的请求头。
 
 ## 为什么需要 token
 

@@ -7,17 +7,14 @@ done
 MODDIR=${0%/*}
 chmod 0755 "$MODDIR/local-bridge-android"
 
-# The bridge token is generated at install time by customize.sh and stored here,
-# outside the module dir so it survives updates. Fallback-generate it if missing
-# (e.g. installed by a manager that skipped customize.sh) so auth is always on.
-# BRIDGE_TOKEN gates access -- on Android any local app can reach 127.0.0.1 and
-# this server runs as root, so a token is required. The SAME token must be set in
-# Miclaw's local MCP config as header  Authorization: Bearer <token>.
-TOKEN_DIR=/data/adb/local_mcp_bridge
-TOKEN_FILE=$TOKEN_DIR/token
+# The bridge token lives inside the module dir (created at install by
+# customize.sh), so it is removed when the module is uninstalled. Fallback-
+# generate it here if missing (e.g. a manager that skipped customize.sh) so auth
+# is always on. BRIDGE_TOKEN gates access -- on Android any local app can reach
+# 127.0.0.1 and this server runs as root, so a token is required. The SAME token
+# must be set in Miclaw's local MCP config as header  Authorization: Bearer <token>.
+TOKEN_FILE="$MODDIR/token"
 if [ ! -s "$TOKEN_FILE" ]; then
-  mkdir -p "$TOKEN_DIR"
-  chmod 700 "$TOKEN_DIR"
   TOKEN="$(cat /proc/sys/kernel/random/uuid)$(cat /proc/sys/kernel/random/uuid)"
   echo "$TOKEN" | tr -d '-' > "$TOKEN_FILE"
   chmod 600 "$TOKEN_FILE"
