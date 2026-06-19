@@ -39,15 +39,19 @@ func main() {
 	)
 
 	s.AddTool(mcp.NewTool("push_file",
-		mcp.WithDescription("Upload a LOCAL file from this device to a URL via HTTP PUT (e.g. to a sandbox upload_url)."),
-		mcp.WithString("local_path", mcp.Required(), mcp.Description("Absolute path of the local file on this device.")),
-		mcp.WithString("url", mcp.Required(), mcp.Description("Destination URL to PUT the bytes to.")),
+		mcp.WithDescription("Send a LOCAL file from THIS phone up to the sandbox. Flow: first call the "+
+			"sandbox server's upload_url(sandbox, dest) to get an https upload URL, then call this "+
+			"with that URL. It does an HTTP PUT of the file bytes."),
+		mcp.WithString("local_path", mcp.Required(), mcp.Description("Absolute path of the file ON THIS PHONE, e.g. /sdcard/Download/x.zip.")),
+		mcp.WithString("url", mcp.Required(), mcp.Description("The https upload URL returned by the sandbox server's upload_url tool. "+
+			"Must be a real http(s) URL -- NOT a sandbox file path or directory like /workspace/...")),
 	), handlePushFile)
 
 	s.AddTool(mcp.NewTool("pull_file",
-		mcp.WithDescription("Download a URL to a LOCAL file on this device via HTTP GET (e.g. save a sandbox download_url result)."),
-		mcp.WithString("url", mcp.Required(), mcp.Description("Source URL to download.")),
-		mcp.WithString("local_path", mcp.Required(), mcp.Description("Absolute local path to save the file to.")),
+		mcp.WithDescription("Save a sandbox file down to THIS phone. Flow: get a download_url from the "+
+			"sandbox server, then call this to GET it to a local path."),
+		mcp.WithString("url", mcp.Required(), mcp.Description("The https download URL from the sandbox server's download_url tool (a real http(s) URL).")),
+		mcp.WithString("local_path", mcp.Required(), mcp.Description("Absolute path ON THIS PHONE to save the file to, e.g. /sdcard/Download/result.csv.")),
 	), handlePullFile)
 
 	s.AddTool(mcp.NewTool("list_files",
