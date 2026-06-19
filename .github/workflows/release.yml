@@ -1,0 +1,51 @@
+name: release
+
+# Builds the native Android (arm64) bridge binary, assembles the flashable
+# KernelSU/Magisk module zip, and attaches it to a GitHub Release on tag push.
+# Tag a release with:  git tag v0.2.0 && git push origin v0.2.0
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r27c
+          local-cache: true
+
+      - name: Build android-arm64 binary
+        run: |
+          export CC="${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+          CGO_ENABLED=1 GOOS=android GOARCH=arm64 \
+            go build -ldflags="-s -w" -o local-bridge-android .
+          file local-bridge-android
+
+      - name: Assemble module zip
+        run: python3 build_zip.py local-bridge-android local-mcp-bridge.zip
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: local-mcp-bridge
+          path: local-mcp-bridge.zip
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: local-mcp-bridge.zip

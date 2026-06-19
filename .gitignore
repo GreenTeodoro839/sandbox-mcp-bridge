@@ -1,0 +1,15 @@
+# build outputs
+local-bridge-android
+local-bridge-arm64
+nettest-android
+*.zip
+
+# go
+/vendor/
+
+# misc / dev scratch
+cacert.pem
+*.log
+.DS_Store
+.idea/
+.vscode/
