@@ -19,6 +19,8 @@ OUT = sys.argv[2] if len(sys.argv) > 2 else os.path.join(ROOT, "local-mcp-bridge
 TEXT = [
     "module.prop",
     "service.sh",
+    "launch.sh",
+    "action.sh",
     "customize.sh",
     "META-INF/com/google/android/update-binary",
     "META-INF/com/google/android/updater-script",

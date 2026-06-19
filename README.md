@@ -62,6 +62,8 @@
 
    > 沙箱的 `exec`/`run_background`/`push_file`/`pull_file` 等都会从这一个 server 里出现。
 
+> 💡 改了 `sandbox.conf` 或想重连后端时，**不必重启手机**：在 KernelSU 管理器里点本模块的 **运行（Action）** 按钮即可快速重启网关，并打印运行状态。
+
 ## Token 是怎么来的
 
 - 模块安装时（`customize.sh`）自动生成一个随机 token（两段内核 UUID 拼成 64 位十六进制，不依赖额外工具），存到**模块目录内** `/data/adb/modules/local_mcp_bridge/token`（仅 root 可读，`0600`）。
