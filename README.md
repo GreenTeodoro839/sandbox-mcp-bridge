@@ -1,6 +1,12 @@
 # sandbox-mcp-bridge
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![release](https://img.shields.io/github/v/release/GreenTeodoro839/sandbox-mcp-bridge)](https://github.com/GreenTeodoro839/sandbox-mcp-bridge/releases/latest)
+[![build](https://github.com/GreenTeodoro839/sandbox-mcp-bridge/actions/workflows/release.yml/badge.svg)](https://github.com/GreenTeodoro839/sandbox-mcp-bridge/actions/workflows/release.yml)
+
 运行在**手机上**的极简 MCP 服务器，给手机 AI 助手（如小米 Miclaw）补上"读写本机文件"的能力。它是 [sandbox-mcp](https://github.com/GreenTeodoro839/sandbox-mcp) 服务端的手机端搭档。
+
+> 🖥️ **服务端**：[sandbox-mcp](https://github.com/GreenTeodoro839/sandbox-mcp) —— Docker 沙箱、命令执行、后台任务、大文件签名 URL。两者配合使用。
 
 ## 它解决什么
 
