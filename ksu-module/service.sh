@@ -21,8 +21,17 @@ if [ ! -s "$TOKEN_FILE" ]; then
 fi
 BRIDGE_TOKEN="$(cat "$TOKEN_FILE")"
 
+# Backend config: the gateway proxies the sandbox tools to your remote sandbox-mcp
+# server and also uses this URL+token for push_file/pull_file. Edit sandbox.conf
+# (created at install by customize.sh) to set SANDBOX_BASE_URL and SANDBOX_TOKEN.
+# If unset, initialize() fails on purpose so Miclaw won't load a half-broken MCP.
+CONF="$MODDIR/sandbox.conf"
+[ -s "$CONF" ] && . "$CONF"
+
 # Native Android build: uses the OS DNS resolver and CA store, no extra config.
 # LOCAL_MCP_ADDR is where it listens (Miclaw connects to http://127.0.0.1:8765/mcp).
 BRIDGE_TOKEN="$BRIDGE_TOKEN" \
 LOCAL_MCP_ADDR=127.0.0.1:8765 \
+SANDBOX_BASE_URL="$SANDBOX_BASE_URL" \
+SANDBOX_TOKEN="$SANDBOX_TOKEN" \
   "$MODDIR/local-bridge-android" > /data/local/tmp/local-bridge.log 2>&1 &

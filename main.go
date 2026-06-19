@@ -1,84 +1,140 @@
-// local-file-bridge: a tiny MCP server meant to run ON the phone (via a KernelSU
-// module). It gives the phone assistant (Miclaw) the ability to move LOCAL files
-// to/from URLs -- e.g. PUT a phone file to a sandbox upload_url, or save a
-// download_url result onto the phone. Plain HTTP on 127.0.0.1 (localhost needs no
-// TLS). Built natively for Android (GOOS=android, CGO via the NDK) so it uses the
-// OS DNS resolver and CA store directly -- no bundled certs or custom DNS.
+// sandbox-gateway: a tiny MCP server that runs ON the phone (via a KernelSU module)
+// and is the SINGLE MCP endpoint Miclaw connects to. It unifies two things into one
+// tool list so Miclaw's per-query tool routing can never split them apart:
+//
+//   - file transfer between the phone and the remote sandbox (push_file / pull_file,
+//     list_files / read_text), handled locally here -- the bytes are read from the
+//     phone by path and streamed to the sandbox server, never through the LLM; and
+//   - every sandbox tool (exec, run_background, get_job, ...) which is PROXIED to the
+//     remote sandbox-mcp server on the user's box.
+//
+// Connectivity gating: `initialize` performs a real initialize against the remote
+// sandbox server. If the box is unreachable (or unconfigured), initialize returns a
+// JSON-RPC error so Miclaw's connection FAILS and the half-broken MCP is never loaded
+// into the model's context. That same call also fetches the box's instructions, which
+// are surfaced (with the file-tool notes appended) to the model.
+//
+// Plain HTTP on 127.0.0.1 (localhost needs no TLS). Built natively for Android
+// (GOOS=android, CGO via the NDK) so it uses the OS DNS resolver + CA store directly.
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
-
-	"github.com/mark3labs/mcp-go/mcp"
-	"github.com/mark3labs/mcp-go/server"
 )
 
-// Built for Android (GOOS=android), so Go resolves DNS via the OS resolver and
-// trusts the OS CA store natively -- no bundled certs or custom DNS needed.
-var httpClient = &http.Client{Timeout: 10 * time.Minute}
+// Long timeout for the data plane (large file transfers); short one for the control
+// plane (initialize / tools/list / health), so a dead box fails fast at connect time.
+var (
+	dataClient = &http.Client{Timeout: 10 * time.Minute}
+	ctrlClient = &http.Client{Timeout: 15 * time.Second}
+)
+
+var (
+	piBase  string // remote sandbox-mcp base URL, e.g. https://sandbox.example.com:40443
+	piToken string // bearer token for the remote /mcp and /files endpoints
+)
+
+const fileInstructions = "\n\n--- File transfer (phone <-> sandbox), handled by this gateway ---\n" +
+	"- push_file(local_path, sandbox, remote_path): copy a file FROM the phone INTO the " +
+	"sandbox workspace. local_path is an absolute phone path (e.g. /sdcard/Download/x.zip); " +
+	"remote_path is the destination name in the workspace (e.g. \"input.zip\").\n" +
+	"- pull_file(sandbox, remote_path, local_path): copy a file FROM the sandbox workspace " +
+	"back ONTO the phone.\n" +
+	"These move the bytes directly; you do NOT need upload_url/download_url for phone<->sandbox " +
+	"transfer. list_files(dir) and read_text(path) inspect the PHONE's own filesystem."
+
+// localTools are served by this gateway itself (not proxied). Their JSON schemas are
+// returned in tools/list alongside the proxied sandbox tools.
+func localTools() []json.RawMessage {
+	defs := []string{
+		`{"name":"push_file","description":"Copy a file FROM this phone INTO the sandbox workspace, in one step (no upload URL needed). Reads the local file and streams it to the sandbox.","inputSchema":{"type":"object","properties":{"local_path":{"type":"string","description":"Absolute path of the file ON THIS PHONE, e.g. /sdcard/Download/x.zip."},"sandbox":{"type":"string","description":"Name of the target sandbox (same name used with exec/run_background)."},"remote_path":{"type":"string","description":"Destination path in the sandbox workspace, e.g. \"input.zip\" or \"data/in.csv\"."}},"required":["local_path","sandbox","remote_path"]}}`,
+		`{"name":"pull_file","description":"Copy a file FROM the sandbox workspace back ONTO this phone, in one step (no download URL needed).","inputSchema":{"type":"object","properties":{"sandbox":{"type":"string","description":"Name of the source sandbox."},"remote_path":{"type":"string","description":"Path of the file in the sandbox workspace, e.g. \"out/result.csv\"."},"local_path":{"type":"string","description":"Absolute path ON THIS PHONE to save the file to, e.g. /sdcard/Download/result.csv."}},"required":["sandbox","remote_path","local_path"]}}`,
+		`{"name":"list_files","description":"List entries in a local directory on THIS phone (not the sandbox; use the sandbox's list_files-equivalent for the sandbox).","inputSchema":{"type":"object","properties":{"dir":{"type":"string","description":"Absolute directory path on the phone."}},"required":["dir"]}}`,
+		`{"name":"read_text","description":"Read a small local text file (<=200KB) from THIS phone.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Absolute file path on the phone."}},"required":["path"]}}`,
+	}
+	out := make([]json.RawMessage, len(defs))
+	for i, d := range defs {
+		out[i] = json.RawMessage(d)
+	}
+	return out
+}
+
+func isLocalTool(name string) bool {
+	switch name {
+	case "push_file", "pull_file", "list_files", "read_text":
+		return true
+	}
+	return false
+}
+
+// --- JSON-RPC envelope (stateless: single JSON body per request, mirroring the
+// remote server's json_response mode, which Miclaw is known to accept) ---
+
+type rpcReq struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      json.RawMessage `json:"id,omitempty"`
+	Method  string          `json:"method"`
+	Params  json.RawMessage `json:"params,omitempty"`
+}
+
+func writeJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func writeResult(w http.ResponseWriter, id json.RawMessage, result any) {
+	writeJSON(w, map[string]any{"jsonrpc": "2.0", "id": rawID(id), "result": result})
+}
+
+func writeError(w http.ResponseWriter, id json.RawMessage, code int, msg string) {
+	writeJSON(w, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      rawID(id),
+		"error":   map[string]any{"code": code, "message": msg},
+	})
+}
+
+func rawID(id json.RawMessage) any {
+	if len(id) == 0 {
+		return nil
+	}
+	return id
+}
 
 func main() {
 	addr := getenv("LOCAL_MCP_ADDR", "127.0.0.1:8765")
+	piBase = strings.TrimRight(os.Getenv("SANDBOX_BASE_URL"), "/")
+	piToken = os.Getenv("SANDBOX_TOKEN")
+	inToken := os.Getenv("BRIDGE_TOKEN")
 
-	s := server.NewMCPServer("local-file-bridge", "0.1.0",
-		server.WithToolCapabilities(true),
-		server.WithInstructions(
-			"This server runs ON the user's phone and ONLY moves files between the phone "+
-				"and a URL. It has NO shell and CANNOT run commands, process data, or use "+
-				"Linux -- for any command / shell / sandbox / 沙箱 task use the separate Linux "+
-				"sandbox MCP server, never this one. Use push_file(local_path, url) to upload a "+
-				"phone file to a sandbox upload_url, and pull_file(url, local_path) to save a "+
-				"sandbox download_url result onto the phone."),
-	)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/mcp", handleMCP)
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, map[string]bool{"ok": true}) })
 
-	s.AddTool(mcp.NewTool("push_file",
-		mcp.WithDescription("Send a LOCAL file from THIS phone up to the sandbox. Flow: first call the "+
-			"sandbox server's upload_url(sandbox, dest) to get an https upload URL, then call this "+
-			"with that URL. It does an HTTP PUT of the file bytes."),
-		mcp.WithString("local_path", mcp.Required(), mcp.Description("Absolute path of the file ON THIS PHONE, e.g. /sdcard/Download/x.zip.")),
-		mcp.WithString("url", mcp.Required(), mcp.Description("The https upload URL returned by the sandbox server's upload_url tool. "+
-			"Must be a real http(s) URL -- NOT a sandbox file path or directory like /workspace/...")),
-	), handlePushFile)
-
-	s.AddTool(mcp.NewTool("pull_file",
-		mcp.WithDescription("Save a sandbox file down to THIS phone. Flow: get a download_url from the "+
-			"sandbox server, then call this to GET it to a local path."),
-		mcp.WithString("url", mcp.Required(), mcp.Description("The https download URL from the sandbox server's download_url tool (a real http(s) URL).")),
-		mcp.WithString("local_path", mcp.Required(), mcp.Description("Absolute path ON THIS PHONE to save the file to, e.g. /sdcard/Download/result.csv.")),
-	), handlePullFile)
-
-	s.AddTool(mcp.NewTool("list_files",
-		mcp.WithDescription("List entries in a local directory on this device."),
-		mcp.WithString("dir", mcp.Required(), mcp.Description("Absolute directory path.")),
-	), handleListFiles)
-
-	s.AddTool(mcp.NewTool("read_text",
-		mcp.WithDescription("Read a small local text file (<=200KB) from this device."),
-		mcp.WithString("path", mcp.Required(), mcp.Description("Absolute file path.")),
-	), handleReadText)
-
-	token := os.Getenv("BRIDGE_TOKEN")
-	var handler http.Handler = server.NewStreamableHTTPServer(s)
-	if token != "" {
-		handler = withAuth(handler, token)
+	var handler http.Handler = mux
+	if inToken != "" {
+		handler = withAuth(handler, inToken)
 	}
-	fmt.Printf("local-file-bridge MCP listening on http://%s/mcp (auth=%t)\n", addr, token != "")
+	fmt.Printf("sandbox-gateway MCP on http://%s/mcp  (inbound auth=%t, backend=%q)\n",
+		addr, inToken != "", piBase)
 	if err := http.ListenAndServe(addr, handler); err != nil {
 		fmt.Fprintln(os.Stderr, "server error:", err)
 		os.Exit(1)
 	}
 }
 
-// withAuth requires every request to carry "Authorization: Bearer <token>".
-// Needed because on Android any local app can reach 127.0.0.1:8765, and this
-// server (running as root) can read/write arbitrary files.
+// withAuth requires every request to carry "Authorization: Bearer <token>". On Android
+// any local app can reach 127.0.0.1, and this server (root) can read/write any file and
+// holds the backend token, so inbound auth is required.
 func withAuth(next http.Handler, token string) http.Handler {
 	expected := "Bearer " + token
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -90,91 +146,281 @@ func withAuth(next http.Handler, token string) http.Handler {
 	})
 }
 
-func getenv(k, def string) string {
-	if v := os.Getenv(k); v != "" {
-		return v
+func handleMCP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		// Stateless JSON mode: no server-initiated SSE stream, so GET/DELETE are unused.
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
 	}
-	return def
+	body, err := io.ReadAll(io.LimitReader(r.Body, 64<<20))
+	if err != nil {
+		writeError(w, nil, -32700, "read error: "+err.Error())
+		return
+	}
+	var req rpcReq
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeError(w, nil, -32700, "parse error: "+err.Error())
+		return
+	}
+
+	// Notifications (no id, e.g. notifications/initialized) get an empty 202.
+	if strings.HasPrefix(req.Method, "notifications/") || len(req.ID) == 0 {
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+
+	ctx := r.Context()
+	switch req.Method {
+	case "initialize":
+		handleInitialize(ctx, w, req)
+	case "ping":
+		writeResult(w, req.ID, map[string]any{})
+	case "tools/list":
+		handleToolsList(ctx, w, req)
+	case "tools/call":
+		handleToolsCall(ctx, w, req)
+	default:
+		// Anything else (resources/*, prompts/*, ...) is forwarded to the backend.
+		res, rpcErr, err := piRPC(ctx, ctrlClient, req.Method, req.Params)
+		if err != nil {
+			writeError(w, req.ID, -32000, "backend error: "+err.Error())
+			return
+		}
+		if rpcErr != nil {
+			writeJSON(w, map[string]any{"jsonrpc": "2.0", "id": rawID(req.ID), "error": rpcErr})
+			return
+		}
+		writeResult(w, req.ID, res)
+	}
 }
 
-func handlePushFile(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	args := req.GetArguments()
-	localPath, _ := args["local_path"].(string)
-	url, _ := args["url"].(string)
-	if localPath == "" || url == "" {
-		return mcp.NewToolResultError("local_path and url are required"), nil
+func handleInitialize(ctx context.Context, w http.ResponseWriter, req rpcReq) {
+	if piBase == "" || piToken == "" {
+		writeError(w, req.ID, -32000,
+			"sandbox gateway not configured: set SANDBOX_BASE_URL and SANDBOX_TOKEN")
+		return
+	}
+	// A real initialize against the backend doubles as the health gate AND fetches the
+	// backend's instructions. If it fails, the whole MCP connection fails (by design).
+	res, rpcErr, err := piRPC(ctx, ctrlClient, "initialize", req.Params)
+	if err != nil {
+		writeError(w, req.ID, -32000, "sandbox backend unreachable: "+err.Error())
+		return
+	}
+	if rpcErr != nil {
+		writeJSON(w, map[string]any{"jsonrpc": "2.0", "id": rawID(req.ID), "error": rpcErr})
+		return
+	}
+	var pi struct {
+		ProtocolVersion string          `json:"protocolVersion"`
+		Capabilities    json.RawMessage `json:"capabilities"`
+		Instructions    string          `json:"instructions"`
+	}
+	_ = json.Unmarshal(res, &pi)
+	if pi.ProtocolVersion == "" {
+		pi.ProtocolVersion = "2025-06-18"
+	}
+	writeResult(w, req.ID, map[string]any{
+		"protocolVersion": pi.ProtocolVersion,
+		"capabilities":    map[string]any{"tools": map[string]any{}},
+		"serverInfo":      map[string]any{"name": "sandbox-gateway", "version": "0.3.0"},
+		"instructions":    pi.Instructions + fileInstructions,
+	})
+}
+
+func handleToolsList(ctx context.Context, w http.ResponseWriter, req rpcReq) {
+	res, rpcErr, err := piRPC(ctx, ctrlClient, "tools/list", req.Params)
+	if err != nil {
+		writeError(w, req.ID, -32000, "sandbox backend unreachable: "+err.Error())
+		return
+	}
+	if rpcErr != nil {
+		writeJSON(w, map[string]any{"jsonrpc": "2.0", "id": rawID(req.ID), "error": rpcErr})
+		return
+	}
+	var piList struct {
+		Tools []json.RawMessage `json:"tools"`
+	}
+	_ = json.Unmarshal(res, &piList)
+	tools := append(piList.Tools, localTools()...) // sandbox tools first, then file tools
+	writeResult(w, req.ID, map[string]any{"tools": tools})
+}
+
+func handleToolsCall(ctx context.Context, w http.ResponseWriter, req rpcReq) {
+	var p struct {
+		Name      string         `json:"name"`
+		Arguments map[string]any `json:"arguments"`
+	}
+	if err := json.Unmarshal(req.Params, &p); err != nil {
+		writeError(w, req.ID, -32602, "invalid params: "+err.Error())
+		return
+	}
+	if isLocalTool(p.Name) {
+		writeResult(w, req.ID, runLocalTool(ctx, p.Name, p.Arguments))
+		return
+	}
+	// Proxy the tool call to the backend verbatim.
+	res, rpcErr, err := piRPC(ctx, dataClient, "tools/call", req.Params)
+	if err != nil {
+		writeError(w, req.ID, -32000, "backend error: "+err.Error())
+		return
+	}
+	if rpcErr != nil {
+		writeJSON(w, map[string]any{"jsonrpc": "2.0", "id": rawID(req.ID), "error": rpcErr})
+		return
+	}
+	writeResult(w, req.ID, res)
+}
+
+// piRPC POSTs a single JSON-RPC request to the backend /mcp and returns its result (or
+// the JSON-RPC error object). Tolerates an SSE-framed ("data: {...}") response body.
+func piRPC(ctx context.Context, client *http.Client, method string, params json.RawMessage) (json.RawMessage, json.RawMessage, error) {
+	reqBody := map[string]any{"jsonrpc": "2.0", "id": 1, "method": method}
+	if len(params) > 0 {
+		reqBody["params"] = params
+	}
+	raw, _ := json.Marshal(reqBody)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, piBase+"/mcp", bytes.NewReader(raw))
+	if err != nil {
+		return nil, nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "application/json, text/event-stream")
+	httpReq.Header.Set("Authorization", "Bearer "+piToken)
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, nil, err
+	}
+	if resp.StatusCode >= 400 {
+		return nil, nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
+	}
+	payload := extractJSON(data)
+	var env struct {
+		Result json.RawMessage `json:"result"`
+		Error  json.RawMessage `json:"error"`
+	}
+	if err := json.Unmarshal(payload, &env); err != nil {
+		return nil, nil, fmt.Errorf("bad backend response: %v", err)
+	}
+	if len(env.Error) > 0 {
+		return nil, env.Error, nil
+	}
+	return env.Result, nil, nil
+}
+
+// extractJSON returns the JSON object from a body that is either a plain JSON-RPC
+// response or an SSE stream whose "data:" line carries it.
+func extractJSON(body []byte) []byte {
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) > 0 && trimmed[0] == '{' {
+		return trimmed
+	}
+	for _, line := range bytes.Split(body, []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		if bytes.HasPrefix(line, []byte("data:")) {
+			return bytes.TrimSpace(line[len("data:"):])
+		}
+	}
+	return trimmed
+}
+
+// --- local tool execution ---
+
+func runLocalTool(ctx context.Context, name string, args map[string]any) map[string]any {
+	switch name {
+	case "push_file":
+		return pushFile(ctx, str(args, "local_path"), str(args, "sandbox"), str(args, "remote_path"))
+	case "pull_file":
+		return pullFile(ctx, str(args, "sandbox"), str(args, "remote_path"), str(args, "local_path"))
+	case "list_files":
+		return listFiles(str(args, "dir"))
+	case "read_text":
+		return readText(str(args, "path"))
+	}
+	return toolErr("unknown tool: " + name)
+}
+
+func pushFile(ctx context.Context, localPath, sandbox, remotePath string) map[string]any {
+	if localPath == "" || sandbox == "" || remotePath == "" {
+		return toolErr("local_path, sandbox and remote_path are required")
 	}
 	f, err := os.Open(localPath)
 	if err != nil {
-		return mcp.NewToolResultError("open: " + err.Error()), nil
+		return toolErr("open: " + err.Error())
 	}
 	defer f.Close()
 	st, _ := f.Stat()
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPut, url, f)
+	u := fmt.Sprintf("%s/files/push?sandbox=%s&path=%s", piBase,
+		url.QueryEscape(sandbox), url.QueryEscape(remotePath))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, u, f)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErr(err.Error())
 	}
+	httpReq.Header.Set("Authorization", "Bearer "+piToken)
+	httpReq.Header.Set("Content-Type", "application/octet-stream")
 	if st != nil {
 		httpReq.ContentLength = st.Size()
 	}
-	resp, err := httpClient.Do(httpReq)
+	resp, err := dataClient.Do(httpReq)
 	if err != nil {
-		return mcp.NewToolResultError("put: " + err.Error()), nil
+		return toolErr("push: " + err.Error())
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	rb, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if resp.StatusCode >= 400 {
+		return toolErr(fmt.Sprintf("push HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(rb))))
+	}
 	var size int64
 	if st != nil {
 		size = st.Size()
 	}
-	return mcp.NewToolResultText(fmt.Sprintf("uploaded %s (%d bytes) -> HTTP %d\n%s",
-		localPath, size, resp.StatusCode, strings.TrimSpace(string(body)))), nil
+	return toolText(fmt.Sprintf("uploaded %s (%d bytes) -> sandbox %s:%s", localPath, size, sandbox, remotePath))
 }
 
-func handlePullFile(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	args := req.GetArguments()
-	url, _ := args["url"].(string)
-	localPath, _ := args["local_path"].(string)
-	if url == "" || localPath == "" {
-		return mcp.NewToolResultError("url and local_path are required"), nil
+func pullFile(ctx context.Context, sandbox, remotePath, localPath string) map[string]any {
+	if sandbox == "" || remotePath == "" || localPath == "" {
+		return toolErr("sandbox, remote_path and local_path are required")
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	u := fmt.Sprintf("%s/files/pull?sandbox=%s&path=%s", piBase,
+		url.QueryEscape(sandbox), url.QueryEscape(remotePath))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErr(err.Error())
 	}
-	resp, err := httpClient.Do(httpReq)
+	httpReq.Header.Set("Authorization", "Bearer "+piToken)
+	resp, err := dataClient.Do(httpReq)
 	if err != nil {
-		return mcp.NewToolResultError("get: " + err.Error()), nil
+		return toolErr("pull: " + err.Error())
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return mcp.NewToolResultError(fmt.Sprintf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))), nil
-	}
-	if err := os.MkdirAll(filepath.Dir(localPath), 0o755); err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErr(fmt.Sprintf("pull HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(b))))
 	}
 	out, err := os.Create(localPath)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErr(err.Error())
 	}
 	defer out.Close()
 	n, err := io.Copy(out, resp.Body)
 	if err != nil {
-		return mcp.NewToolResultError("write: " + err.Error()), nil
+		return toolErr("write: " + err.Error())
 	}
-	return mcp.NewToolResultText(fmt.Sprintf("downloaded %d bytes -> %s", n, localPath)), nil
+	return toolText(fmt.Sprintf("downloaded %d bytes -> %s", n, localPath))
 }
 
-func handleListFiles(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	args := req.GetArguments()
-	dir, _ := args["dir"].(string)
+func listFiles(dir string) map[string]any {
 	if dir == "" {
-		return mcp.NewToolResultError("dir is required"), nil
+		return toolErr("dir is required")
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErr(err.Error())
 	}
 	var lines []string
 	for _, e := range entries {
@@ -187,25 +433,47 @@ func handleListFiles(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToo
 		}
 		lines = append(lines, fmt.Sprintf("%s\t%s\t%d", kind, e.Name(), sz))
 	}
-	return mcp.NewToolResultText(strings.Join(lines, "\n")), nil
+	return toolText(strings.Join(lines, "\n"))
 }
 
-func handleReadText(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	args := req.GetArguments()
-	path, _ := args["path"].(string)
+func readText(path string) map[string]any {
 	if path == "" {
-		return mcp.NewToolResultError("path is required"), nil
+		return toolErr("path is required")
 	}
 	st, err := os.Stat(path)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErr(err.Error())
 	}
 	if st.Size() > 200*1024 {
-		return mcp.NewToolResultError(fmt.Sprintf("file too large (%d bytes); use pull/push instead", st.Size())), nil
+		return toolErr(fmt.Sprintf("file too large (%d bytes); use pull_file/push_file instead", st.Size()))
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErr(err.Error())
 	}
-	return mcp.NewToolResultText(string(data)), nil
+	return toolText(string(data))
+}
+
+// --- helpers ---
+
+func toolText(text string) map[string]any {
+	return map[string]any{"content": []map[string]any{{"type": "text", "text": text}}}
+}
+
+func toolErr(text string) map[string]any {
+	return map[string]any{"content": []map[string]any{{"type": "text", "text": text}}, "isError": true}
+}
+
+func str(m map[string]any, k string) string {
+	if v, ok := m[k].(string); ok {
+		return v
+	}
+	return ""
+}
+
+func getenv(k, def string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return def
 }

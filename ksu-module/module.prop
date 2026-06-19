@@ -1,6 +1,6 @@
 id=local_mcp_bridge
-name=Local MCP File Bridge
-version=v0.2.2
-versionCode=4
+name=Sandbox Gateway (MCP)
+version=v0.3.0
+versionCode=5
 author=GreenTeodoro839
-description=Local MCP server on 127.0.0.1:8765 that bridges phone files to/from the remote sandbox (push_file/pull_file). Native Android build (GOOS=android), uses the OS DNS + CA store.
+description=Single local MCP (127.0.0.1:8765) Miclaw connects to: proxies the remote sandbox tools (exec/run_background/...) AND serves phone<->sandbox file transfer (push_file/pull_file). initialize() gates on backend reachability. Native Android build, OS DNS+CA.

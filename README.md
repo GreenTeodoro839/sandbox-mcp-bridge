@@ -4,28 +4,29 @@
 [![release](https://img.shields.io/github/v/release/GreenTeodoro839/sandbox-mcp-bridge)](https://github.com/GreenTeodoro839/sandbox-mcp-bridge/releases/latest)
 [![build](https://github.com/GreenTeodoro839/sandbox-mcp-bridge/actions/workflows/release.yml/badge.svg)](https://github.com/GreenTeodoro839/sandbox-mcp-bridge/actions/workflows/release.yml)
 
-运行在**手机上**的极简 MCP 服务器，给手机 AI 助手（如小米 Miclaw）补上"读写本机文件"的能力。它是 [sandbox-mcp](https://github.com/GreenTeodoro839/sandbox-mcp) 服务端的手机端搭档。
+运行在**手机上**的极简 MCP **网关**：它是手机 AI 助手（如小米 Miclaw）唯一连接的那个 MCP，把远程 [sandbox-mcp](https://github.com/GreenTeodoro839/sandbox-mcp) 的沙箱工具**代理**过来，同时在本地提供**手机⇄沙箱的文件传输**——所有工具汇成一张表，避免被助手的"按查询选工具/选 server"路由拆散。
 
-> 🖥️ **服务端**：[sandbox-mcp](https://github.com/GreenTeodoro839/sandbox-mcp) —— Docker 沙箱、命令执行、后台任务、大文件签名 URL。两者配合使用。
+> 🖥️ **服务端**：[sandbox-mcp](https://github.com/GreenTeodoro839/sandbox-mcp) —— Docker 沙箱、命令执行、后台任务。网关在后端不可达时让连接失败，不把半残的 MCP 加载进上下文。
 
 ## 它解决什么
 
-手机助手能调用远程沙箱（sandbox-mcp）跑命令、处理文件，但**手机本身没有 `curl` 之类工具**，没法把本机文件推到沙箱、或把结果存回本机。本桥接器以 KernelSU/Magisk 模块形式跑在手机上，监听 `127.0.0.1:8765`，只做一件事：在**本机文件**和 **URL** 之间搬字节。
+手机助手默认按查询语义只挑**一个** MCP/一批工具喂给模型，所以"沙箱"那轮里、另一个只管文件的 MCP 的工具根本不在候选集，助手就会说"做不到"。本网关把两边合成**一个 server**：
 
-典型流程：
-1. 助手向沙箱要一个 `upload_url` → 调本桥 `push_file(本机路径, upload_url)` 把文件推进沙箱
-2. 沙箱处理完给出 `download_url` → 调本桥 `pull_file(download_url, 本机路径)` 存回手机
+- **沙箱工具**（`exec` / `run_background` / `get_job` / `list_files` …）原样代理到你的远程 sandbox-mcp；
+- **文件传输**（`push_file` / `pull_file`）在网关本地完成——按**路径**读手机文件、直接流给沙箱服务器，字节不经过模型（避免 base64 截断）。
+
+握手时网关会真的去 `initialize` 一次后端：通了才返回成功（并把后端的使用说明透传给模型），不通就返回错误让 Miclaw 直接连接失败。
 
 ## 工具
 
+代理自服务端的沙箱工具（exec/run_background/...）之外，本网关本地提供：
+
 | 工具 | 作用 |
 |---|---|
-| `push_file(local_path, url)` | 把本机文件 PUT 到一个 URL（如沙箱 upload_url） |
-| `pull_file(url, local_path)` | 把一个 URL GET 下来存到本机（如沙箱 download_url） |
-| `list_files(dir)` | 列本机目录 |
-| `read_text(path)` | 读本机小文本文件（≤200KB） |
-
-> 它**没有 shell、不能执行命令**——命令/沙箱类任务走 sandbox-mcp 服务端，不是这里。
+| `push_file(local_path, sandbox, remote_path)` | 把手机文件**一步**传进指定沙箱的 workspace（无需先拿 upload_url） |
+| `pull_file(sandbox, remote_path, local_path)` | 把沙箱里的文件**一步**存回手机 |
+| `list_files(dir)` | 列**手机**本机目录 |
+| `read_text(path)` | 读**手机**本机小文本文件（≤200KB） |
 
 ## 安装
 
@@ -36,13 +37,20 @@
    Authorization: Bearer 1a2b3c...（64 位十六进制）
    ```
    记下它（也可稍后用 `su -c 'cat /data/adb/modules/local_mcp_bridge/token'` 再看）。
-4. 重启手机，桥接器会随开机启动，监听 `http://127.0.0.1:8765/mcp`。
-5. 在 Miclaw 里**再加一个 URL 型 MCP 服务器**。Miclaw 一次只能加一个 server，直接粘贴下面这条，把 `<BRIDGE_TOKEN>` 换成第 3 步那个 token：
+4. **配置后端**（关键）：编辑 `sandbox.conf`，填你的远程 sandbox-mcp 地址和 token，然后重启：
+   ```
+   su -c 'vi /data/adb/modules/local_mcp_bridge/sandbox.conf'
+   # SANDBOX_BASE_URL=https://你的服务器:端口      （PUBLIC_BASE_URL，不含末尾 /mcp）
+   # SANDBOX_TOKEN=你的 SMCP_TOKEN                  （和服务端 MCP 用的同一个 Bearer）
+   ```
+   两项都填好前，Miclaw 的连接会（故意）加载失败。
+5. 重启手机，网关随开机启动，监听 `http://127.0.0.1:8765/mcp`。
+6. 在 Miclaw 里**只加这一个** URL 型 MCP 服务器（不要再单独加远程 sandbox-mcp，否则工具重复、又会被路由拆开）。把 `<BRIDGE_TOKEN>` 换成第 3 步那个 token：
 
    ```json
    {
      "mcpServers": {
-       "bridge": {
+       "sandbox": {
          "url": "http://127.0.0.1:8765/mcp",
          "headers": {
            "Authorization": "Bearer <BRIDGE_TOKEN>"
@@ -52,7 +60,7 @@
    }
    ```
 
-   > 配套的[服务端 sandbox-mcp](https://github.com/GreenTeodoro839/sandbox-mcp) 作为另一个 server 单独添加（模板见该仓库 README）。
+   > 沙箱的 `exec`/`run_background`/`push_file`/`pull_file` 等都会从这一个 server 里出现。
 
 ## Token 是怎么来的
 
