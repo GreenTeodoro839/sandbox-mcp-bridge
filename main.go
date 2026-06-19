@@ -103,6 +103,20 @@ func writeError(w http.ResponseWriter, id json.RawMessage, code int, msg string)
 	})
 }
 
+// writeGateFailure fails the request with a non-2xx HTTP status. Miclaw's MCP transport
+// treats a non-2xx status as a hard connection failure (observed: HTTP 401 -> the server
+// is dropped/auto-disabled and never loaded), which is exactly what we want when the
+// backend is unreachable or unconfigured -- a 200 + JSON-RPC error would not reliably
+// stop the half-broken MCP from loading. 503 = backend down.
+func writeGateFailure(w http.ResponseWriter, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusServiceUnavailable)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"jsonrpc": "2.0", "id": nil,
+		"error": map[string]any{"code": -32000, "message": msg},
+	})
+}
+
 func rawID(id json.RawMessage) any {
 	if len(id) == 0 {
 		return nil
@@ -196,19 +210,19 @@ func handleMCP(w http.ResponseWriter, r *http.Request) {
 
 func handleInitialize(ctx context.Context, w http.ResponseWriter, req rpcReq) {
 	if piBase == "" || piToken == "" {
-		writeError(w, req.ID, -32000,
-			"sandbox gateway not configured: set SANDBOX_BASE_URL and SANDBOX_TOKEN")
+		writeGateFailure(w, "sandbox gateway not configured: set SANDBOX_BASE_URL and SANDBOX_TOKEN")
 		return
 	}
 	// A real initialize against the backend doubles as the health gate AND fetches the
-	// backend's instructions. If it fails, the whole MCP connection fails (by design).
+	// backend's instructions. Any failure -> non-2xx so Miclaw fails the connection and
+	// never loads this MCP into the model's context (by design).
 	res, rpcErr, err := piRPC(ctx, ctrlClient, "initialize", req.Params)
 	if err != nil {
-		writeError(w, req.ID, -32000, "sandbox backend unreachable: "+err.Error())
+		writeGateFailure(w, "sandbox backend unreachable: "+err.Error())
 		return
 	}
 	if rpcErr != nil {
-		writeJSON(w, map[string]any{"jsonrpc": "2.0", "id": rawID(req.ID), "error": rpcErr})
+		writeGateFailure(w, "sandbox backend rejected initialize: "+string(rpcErr))
 		return
 	}
 	var pi struct {
@@ -231,7 +245,8 @@ func handleInitialize(ctx context.Context, w http.ResponseWriter, req rpcReq) {
 func handleToolsList(ctx context.Context, w http.ResponseWriter, req rpcReq) {
 	res, rpcErr, err := piRPC(ctx, ctrlClient, "tools/list", req.Params)
 	if err != nil {
-		writeError(w, req.ID, -32000, "sandbox backend unreachable: "+err.Error())
+		// tools/list is part of connection setup -> fail hard (non-2xx) like initialize.
+		writeGateFailure(w, "sandbox backend unreachable: "+err.Error())
 		return
 	}
 	if rpcErr != nil {
