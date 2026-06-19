@@ -37,9 +37,22 @@
    ```
    记下它（也可稍后用 `su -c 'cat /data/adb/local_mcp_bridge/token'` 再看）。
 4. 重启手机，桥接器会随开机启动，监听 `http://127.0.0.1:8765/mcp`。
-5. 在 Miclaw 里**再加一个 URL 型 MCP 服务器**：
-   - URL：`http://127.0.0.1:8765/mcp`
-   - 请求头：`Authorization: Bearer <上面那个 token>`
+5. 在 Miclaw 里**再加一个 URL 型 MCP 服务器**。Miclaw 一次只能加一个 server，直接粘贴下面这条，把 `<BRIDGE_TOKEN>` 换成第 3 步那个 token：
+
+   ```json
+   {
+     "mcpServers": {
+       "bridge": {
+         "url": "http://127.0.0.1:8765/mcp",
+         "headers": {
+           "Authorization": "Bearer <BRIDGE_TOKEN>"
+         }
+       }
+     }
+   }
+   ```
+
+   > 配套的[服务端 sandbox-mcp](https://github.com/GreenTeodoro839/sandbox-mcp) 作为另一个 server 单独添加（模板见该仓库 README）。
 
 ## Token 是怎么来的
 
