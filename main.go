@@ -2,17 +2,19 @@
 // and is the SINGLE MCP endpoint Miclaw connects to. It unifies two things into one
 // tool list so Miclaw's per-query tool routing can never split them apart:
 //
-//   - file transfer between the phone and the remote sandbox (push_file / pull_file),
-//     handled locally here -- the bytes are read from the phone by path and streamed
-//     to the sandbox server, never through the LLM; and
-//   - every sandbox tool (exec, run_background, get_job, ...) which is PROXIED to the
-//     remote sandbox-mcp server on the user's box.
+//   - file transfer between the phone and the remote sandbox: the gateway serves its
+//     own upload_file / download_file (by path) that REPLACE the backend's same-named
+//     URL-mode tools -- the bytes are read from the phone by path and streamed to the
+//     sandbox server, never through the LLM; and
+//   - every other sandbox tool (exec, run_background, get_job, ...) which is PROXIED to
+//     the remote sandbox-mcp server on the user's box.
 //
 // Connectivity gating: `initialize` performs a real initialize against the remote
 // sandbox server. If the box is unreachable (or unconfigured), initialize returns a
 // JSON-RPC error so Miclaw's connection FAILS and the half-broken MCP is never loaded
 // into the model's context. That same call also fetches the box's instructions, which
-// are surfaced (with the file-tool notes appended) to the model.
+// are surfaced to the model as-is (they reference upload_file/download_file by name, so
+// they stay correct even though the gateway swaps those tools' mechanism).
 //
 // Plain HTTP on 127.0.0.1 (localhost needs no TLS). Built natively for Android
 // (GOOS=android, CGO via the NDK) so it uses the OS DNS resolver + CA store directly.
@@ -43,34 +45,20 @@ var (
 	piToken string // bearer token for the remote /mcp and /files endpoints
 )
 
-const fileInstructions = "\n\n--- File transfer (phone <-> sandbox), handled by this gateway ---\n" +
-	"- push_file(local_path, sandbox, remote_path): copy a file FROM the phone INTO the " +
-	"sandbox workspace in ONE step. local_path is the absolute phone path (e.g. " +
-	"/sdcard/Download/x.zip); sandbox is the target sandbox name; remote_path is the " +
-	"destination in the workspace. It streams the bytes directly -- you do NOT need " +
-	"upload_url/download_url, and the sandbox itself CANNOT read phone paths (never pass " +
-	"/sdcard/... to exec or fetch_url).\n" +
-	"  IMPORTANT: remote_path MUST be a RELATIVE name like \"input.zip\" or \"data/in.csv\", " +
-	"NOT an absolute path like \"/tmp/input.zip\". The workspace is /workspace inside the " +
-	"container; /tmp, /home, /root are SEPARATE places, so \"/tmp/input.zip\" would land at " +
-	"/workspace/tmp/input.zip -- the wrong spot. Use just \"input.zip\" so exec can find it.\n" +
-	"- pull_file(sandbox, remote_path, local_path): copy a file FROM the sandbox workspace " +
-	"back ONTO the phone (remote_path follows the same relative-name rule; local_path is e.g. " +
-	"/sdcard/Download/result.csv). To put a sandbox file onto phone storage use pull_file, " +
-	"NOT download_url (download_url is only for giving the USER a browser link)."
-
-// hiddenFromPhone names backend tools the gateway drops from the list shown to Miclaw:
-// upload_url hands back a signed PUT URL, but the phone has no way to PUT a local file,
-// so it is a dead end here -- push_file (a localTool) replaces it. The backend keeps
-// exposing upload_url to other clients; only Miclaw's view is trimmed.
-var hiddenFromPhone = map[string]bool{"upload_url": true}
+// hiddenFromPhone names backend tools the gateway REPLACES with same-named local tools
+// tailored to the phone. The backend's upload_file/download_file hand back signed URLs
+// (general clients PUT/GET the bytes out-of-band); the phone can't do that, so the
+// gateway drops the backend versions and serves its own upload_file/download_file (below)
+// that move bytes by path. Same names => the backend's generic instructions (which refer
+// to upload_file/download_file by name, not mechanism) still read correctly for Miclaw.
+var hiddenFromPhone = map[string]bool{"upload_file": true, "download_file": true}
 
 // localTools are served by this gateway itself (not proxied). Their JSON schemas are
-// returned in tools/list alongside the proxied sandbox tools.
+// returned in tools/list, replacing the backend's same-named upload_file/download_file.
 func localTools() []json.RawMessage {
 	defs := []string{
-		`{"name":"push_file","description":"Copy a file FROM this phone INTO the sandbox workspace, in one step (no upload URL needed). Reads the local file and streams it to the sandbox.","inputSchema":{"type":"object","properties":{"local_path":{"type":"string","description":"Absolute path of the file ON THIS PHONE, e.g. /sdcard/Download/x.zip."},"sandbox":{"type":"string","description":"Name of the target sandbox (same name used with exec/run_background)."},"remote_path":{"type":"string","description":"Destination path in the sandbox workspace, e.g. \"input.zip\" or \"data/in.csv\"."}},"required":["local_path","sandbox","remote_path"]}}`,
-		`{"name":"pull_file","description":"Copy a file FROM the sandbox workspace back ONTO this phone, in one step (no download URL needed).","inputSchema":{"type":"object","properties":{"sandbox":{"type":"string","description":"Name of the source sandbox."},"remote_path":{"type":"string","description":"Path of the file in the sandbox workspace, e.g. \"out/result.csv\"."},"local_path":{"type":"string","description":"Absolute path ON THIS PHONE to save the file to, e.g. /sdcard/Download/result.csv."}},"required":["sandbox","remote_path","local_path"]}}`,
+		`{"name":"upload_file","description":"Bring a file FROM this phone INTO the sandbox workspace, in one step. Reads local_path on the phone and streams the bytes to the sandbox at dest.","inputSchema":{"type":"object","properties":{"local_path":{"type":"string","description":"Absolute path of the file ON THIS PHONE, e.g. /sdcard/Download/x.zip."},"sandbox":{"type":"string","description":"Name of the target sandbox (same name used with exec/run_background)."},"dest":{"type":"string","description":"Destination in the sandbox workspace, a RELATIVE name e.g. \"input.zip\" or \"data/in.csv\" -- NOT /tmp/... (the workspace is /workspace, so \"/tmp/x\" would land at /workspace/tmp/x)."}},"required":["local_path","sandbox","dest"]}}`,
+		`{"name":"download_file","description":"Get a file OUT of the sandbox workspace (src). If local_path is given, the file is SAVED to that path on this phone; if local_path is omitted, returns a one-time download LINK to give the user.","inputSchema":{"type":"object","properties":{"sandbox":{"type":"string","description":"Name of the source sandbox."},"src":{"type":"string","description":"Path of the file in the sandbox workspace, e.g. \"out/result.csv\"."},"local_path":{"type":"string","description":"Optional. Absolute path ON THIS PHONE to save to, e.g. /sdcard/Download/result.csv. Omit to get a browser download link instead."}},"required":["sandbox","src"]}}`,
 	}
 	out := make([]json.RawMessage, len(defs))
 	for i, d := range defs {
@@ -81,7 +69,7 @@ func localTools() []json.RawMessage {
 
 func isLocalTool(name string) bool {
 	switch name {
-	case "push_file", "pull_file":
+	case "upload_file", "download_file":
 		return true
 	}
 	return false
@@ -249,7 +237,11 @@ func handleInitialize(ctx context.Context, w http.ResponseWriter, req rpcReq) {
 		"protocolVersion": pi.ProtocolVersion,
 		"capabilities":    map[string]any{"tools": map[string]any{}},
 		"serverInfo":      map[string]any{"name": "sandbox-gateway"},
-		"instructions":    pi.Instructions + fileInstructions,
+		// The backend's instructions are already generic (they name upload_file/
+		// download_file by intent, not mechanism), and the gateway's same-named local
+		// tools carry the phone-specific mechanism in their own descriptions -- so no
+		// extra gateway instructions are needed.
+		"instructions": pi.Instructions,
 	})
 }
 
@@ -371,17 +363,19 @@ func extractJSON(body []byte) []byte {
 
 func runLocalTool(ctx context.Context, name string, args map[string]any) map[string]any {
 	switch name {
-	case "push_file":
-		return pushFile(ctx, str(args, "local_path"), str(args, "sandbox"), str(args, "remote_path"))
-	case "pull_file":
-		return pullFile(ctx, str(args, "sandbox"), str(args, "remote_path"), str(args, "local_path"))
+	case "upload_file":
+		return uploadFile(ctx, str(args, "local_path"), str(args, "sandbox"), str(args, "dest"))
+	case "download_file":
+		return downloadFile(ctx, str(args, "sandbox"), str(args, "src"), str(args, "local_path"))
 	}
 	return toolErr("unknown tool: " + name)
 }
 
-func pushFile(ctx context.Context, localPath, sandbox, remotePath string) map[string]any {
-	if localPath == "" || sandbox == "" || remotePath == "" {
-		return toolErr("local_path, sandbox and remote_path are required")
+// uploadFile reads a file by path from the phone and streams it into the sandbox
+// workspace -- the phone-side replacement for the backend's URL-mode upload_file.
+func uploadFile(ctx context.Context, localPath, sandbox, dest string) map[string]any {
+	if localPath == "" || sandbox == "" || dest == "" {
+		return toolErr("local_path, sandbox and dest are required")
 	}
 	f, err := os.Open(localPath)
 	if err != nil {
@@ -390,7 +384,7 @@ func pushFile(ctx context.Context, localPath, sandbox, remotePath string) map[st
 	defer f.Close()
 	st, _ := f.Stat()
 	u := fmt.Sprintf("%s/files/push?sandbox=%s&path=%s", piBase,
-		url.QueryEscape(sandbox), url.QueryEscape(remotePath))
+		url.QueryEscape(sandbox), url.QueryEscape(dest))
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, u, f)
 	if err != nil {
 		return toolErr(err.Error())
@@ -402,26 +396,49 @@ func pushFile(ctx context.Context, localPath, sandbox, remotePath string) map[st
 	}
 	resp, err := dataClient.Do(httpReq)
 	if err != nil {
-		return toolErr("push: " + err.Error())
+		return toolErr("upload: " + err.Error())
 	}
 	defer resp.Body.Close()
 	rb, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	if resp.StatusCode >= 400 {
-		return toolErr(fmt.Sprintf("push HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(rb))))
+		return toolErr(fmt.Sprintf("upload HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(rb))))
 	}
 	var size int64
 	if st != nil {
 		size = st.Size()
 	}
-	return toolText(fmt.Sprintf("uploaded %s (%d bytes) -> sandbox %s:%s", localPath, size, sandbox, remotePath))
+	return toolText(fmt.Sprintf("uploaded %s (%d bytes) -> sandbox %s:%s", localPath, size, sandbox, dest))
 }
 
-func pullFile(ctx context.Context, sandbox, remotePath, localPath string) map[string]any {
-	if sandbox == "" || remotePath == "" || localPath == "" {
-		return toolErr("sandbox, remote_path and local_path are required")
+// downloadFile gets a file out of the sandbox workspace. With local_path it SAVES the
+// bytes to that phone path; without it, it asks the backend's download_file for a
+// one-time link and returns that (for handing to the user).
+func downloadFile(ctx context.Context, sandbox, src, localPath string) map[string]any {
+	if sandbox == "" || src == "" {
+		return toolErr("sandbox and src are required")
 	}
+	if localPath == "" {
+		// link mode: the backend's download_file mints a one-time GET URL.
+		params, _ := json.Marshal(map[string]any{
+			"name":      "download_file",
+			"arguments": map[string]any{"sandbox": sandbox, "src": src},
+		})
+		res, rpcErr, err := piRPC(ctx, dataClient, "tools/call", params)
+		if err != nil {
+			return toolErr("download link: " + err.Error())
+		}
+		if rpcErr != nil {
+			return toolErr("download link: " + string(rpcErr))
+		}
+		var out map[string]any
+		if json.Unmarshal(res, &out) == nil && out != nil {
+			return out
+		}
+		return toolErr("download link: unexpected backend response")
+	}
+	// save mode: stream the bytes onto the phone at local_path.
 	u := fmt.Sprintf("%s/files/pull?sandbox=%s&path=%s", piBase,
-		url.QueryEscape(sandbox), url.QueryEscape(remotePath))
+		url.QueryEscape(sandbox), url.QueryEscape(src))
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return toolErr(err.Error())
@@ -429,12 +446,12 @@ func pullFile(ctx context.Context, sandbox, remotePath, localPath string) map[st
 	httpReq.Header.Set("Authorization", "Bearer "+piToken)
 	resp, err := dataClient.Do(httpReq)
 	if err != nil {
-		return toolErr("pull: " + err.Error())
+		return toolErr("download: " + err.Error())
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return toolErr(fmt.Sprintf("pull HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(b))))
+		return toolErr(fmt.Sprintf("download HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(b))))
 	}
 	out, err := os.Create(localPath)
 	if err != nil {

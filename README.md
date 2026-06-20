@@ -13,18 +13,18 @@
 手机助手默认按查询语义只挑**一个** MCP/一批工具喂给模型，所以"沙箱"那轮里、另一个只管文件的 MCP 的工具根本不在候选集，助手就会说"做不到"。本网关把两边合成**一个 server**：
 
 - **沙箱工具**（`exec` / `run_background` / `get_job` / `list_files` …）原样代理到你的远程 sandbox-mcp；
-- **文件传输**（`push_file` / `pull_file`）在网关本地完成——按**路径**读手机文件、直接流给沙箱服务器，字节不经过模型（避免 base64 截断）。
+- **文件传输**（`upload_file` / `download_file`）在网关本地**改写**：后端那两个同名工具是"产签名 URL"（通用客户端自己 PUT/GET），网关把它们替换成"按**路径**直传/直存"——读手机文件流给沙箱、或把沙箱文件写回手机，字节不经过模型（避免 base64 截断）。
 
-握手时网关会真的去 `initialize` 一次后端：通了才返回成功（并把后端的使用说明透传给模型），不通就返回错误让 Miclaw 直接连接失败。
+握手时网关会真的去 `initialize` 一次后端：通了才返回成功（并把后端的使用说明**原样**透传给模型——说明里只按名字提 `upload_file`/`download_file`，不提机制，所以两侧通用），不通就返回错误让 Miclaw 直接连接失败。
 
 ## 工具
 
-代理自服务端的沙箱工具（exec/run_background/...）之外，本网关本地提供：
+网关把后端的 `upload_file` / `download_file`（URL 模式）**同名替换**成手机版（路径模式），其余沙箱工具原样代理：
 
 | 工具 | 作用 |
 |---|---|
-| `push_file(local_path, sandbox, remote_path)` | 把手机文件**一步**传进指定沙箱的 workspace（无需先拿 upload_url） |
-| `pull_file(sandbox, remote_path, local_path)` | 把沙箱里的文件**一步**存回手机 |
+| `upload_file(local_path, sandbox, dest)` | 把手机文件**一步**传进指定沙箱的 workspace（按路径，无需 URL） |
+| `download_file(sandbox, src, local_path?)` | 给了 `local_path` 就把沙箱文件**存回手机**；不给就返回一个一次性下载直链给用户 |
 
 ## 安装
 
@@ -58,7 +58,7 @@
    }
    ```
 
-   > 沙箱的 `exec`/`run_background`/`push_file`/`pull_file` 等都会从这一个 server 里出现。
+   > 沙箱的 `exec`/`run_background`/`upload_file`/`download_file` 等都会从这一个 server 里出现。
 
 > 💡 改了 `sandbox.conf` 或想重连后端时，**不必重启手机**：在 KernelSU 管理器里点本模块的 **运行（Action）** 按钮即可快速重启网关，并打印运行状态。
 
