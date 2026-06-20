@@ -25,8 +25,6 @@
 |---|---|
 | `push_file(local_path, sandbox, remote_path)` | 把手机文件**一步**传进指定沙箱的 workspace（无需先拿 upload_url） |
 | `pull_file(sandbox, remote_path, local_path)` | 把沙箱里的文件**一步**存回手机 |
-| `list_files(dir)` | 列**手机**本机目录 |
-| `read_text(path)` | 读**手机**本机小文本文件（≤200KB） |
 
 ## 安装
 

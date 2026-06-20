@@ -1,6 +1,6 @@
 id=local_mcp_bridge
 name=Sandbox Gateway (MCP)
-version=v0.3.1
-versionCode=6
+version=v0.3.2
+versionCode=7
 author=GreenTeodoro839
 description=Single local MCP (127.0.0.1:8765) Miclaw connects to: proxies the remote sandbox tools (exec/run_background/...) AND serves phone<->sandbox file transfer (push_file/pull_file). initialize() gates on backend reachability. Tap the action button to restart it. Native Android build, OS DNS+CA.

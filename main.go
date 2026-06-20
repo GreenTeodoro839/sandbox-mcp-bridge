@@ -2,9 +2,9 @@
 // and is the SINGLE MCP endpoint Miclaw connects to. It unifies two things into one
 // tool list so Miclaw's per-query tool routing can never split them apart:
 //
-//   - file transfer between the phone and the remote sandbox (push_file / pull_file,
-//     list_files / read_text), handled locally here -- the bytes are read from the
-//     phone by path and streamed to the sandbox server, never through the LLM; and
+//   - file transfer between the phone and the remote sandbox (push_file / pull_file),
+//     handled locally here -- the bytes are read from the phone by path and streamed
+//     to the sandbox server, never through the LLM; and
 //   - every sandbox tool (exec, run_background, get_job, ...) which is PROXIED to the
 //     remote sandbox-mcp server on the user's box.
 //
@@ -50,7 +50,7 @@ const fileInstructions = "\n\n--- File transfer (phone <-> sandbox), handled by 
 	"- pull_file(sandbox, remote_path, local_path): copy a file FROM the sandbox workspace " +
 	"back ONTO the phone.\n" +
 	"These move the bytes directly; you do NOT need upload_url/download_url for phone<->sandbox " +
-	"transfer. list_files(dir) and read_text(path) inspect the PHONE's own filesystem."
+	"transfer."
 
 // localTools are served by this gateway itself (not proxied). Their JSON schemas are
 // returned in tools/list alongside the proxied sandbox tools.
@@ -58,8 +58,6 @@ func localTools() []json.RawMessage {
 	defs := []string{
 		`{"name":"push_file","description":"Copy a file FROM this phone INTO the sandbox workspace, in one step (no upload URL needed). Reads the local file and streams it to the sandbox.","inputSchema":{"type":"object","properties":{"local_path":{"type":"string","description":"Absolute path of the file ON THIS PHONE, e.g. /sdcard/Download/x.zip."},"sandbox":{"type":"string","description":"Name of the target sandbox (same name used with exec/run_background)."},"remote_path":{"type":"string","description":"Destination path in the sandbox workspace, e.g. \"input.zip\" or \"data/in.csv\"."}},"required":["local_path","sandbox","remote_path"]}}`,
 		`{"name":"pull_file","description":"Copy a file FROM the sandbox workspace back ONTO this phone, in one step (no download URL needed).","inputSchema":{"type":"object","properties":{"sandbox":{"type":"string","description":"Name of the source sandbox."},"remote_path":{"type":"string","description":"Path of the file in the sandbox workspace, e.g. \"out/result.csv\"."},"local_path":{"type":"string","description":"Absolute path ON THIS PHONE to save the file to, e.g. /sdcard/Download/result.csv."}},"required":["sandbox","remote_path","local_path"]}}`,
-		`{"name":"list_files","description":"List entries in a local directory on THIS phone (not the sandbox; use the sandbox's list_files-equivalent for the sandbox).","inputSchema":{"type":"object","properties":{"dir":{"type":"string","description":"Absolute directory path on the phone."}},"required":["dir"]}}`,
-		`{"name":"read_text","description":"Read a small local text file (<=200KB) from THIS phone.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Absolute file path on the phone."}},"required":["path"]}}`,
 	}
 	out := make([]json.RawMessage, len(defs))
 	for i, d := range defs {
@@ -70,7 +68,7 @@ func localTools() []json.RawMessage {
 
 func isLocalTool(name string) bool {
 	switch name {
-	case "push_file", "pull_file", "list_files", "read_text":
+	case "push_file", "pull_file":
 		return true
 	}
 	return false
@@ -352,10 +350,6 @@ func runLocalTool(ctx context.Context, name string, args map[string]any) map[str
 		return pushFile(ctx, str(args, "local_path"), str(args, "sandbox"), str(args, "remote_path"))
 	case "pull_file":
 		return pullFile(ctx, str(args, "sandbox"), str(args, "remote_path"), str(args, "local_path"))
-	case "list_files":
-		return listFiles(str(args, "dir"))
-	case "read_text":
-		return readText(str(args, "path"))
 	}
 	return toolErr("unknown tool: " + name)
 }
@@ -427,46 +421,6 @@ func pullFile(ctx context.Context, sandbox, remotePath, localPath string) map[st
 		return toolErr("write: " + err.Error())
 	}
 	return toolText(fmt.Sprintf("downloaded %d bytes -> %s", n, localPath))
-}
-
-func listFiles(dir string) map[string]any {
-	if dir == "" {
-		return toolErr("dir is required")
-	}
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return toolErr(err.Error())
-	}
-	var lines []string
-	for _, e := range entries {
-		kind := "file"
-		var sz int64
-		if e.IsDir() {
-			kind = "dir"
-		} else if info, err := e.Info(); err == nil {
-			sz = info.Size()
-		}
-		lines = append(lines, fmt.Sprintf("%s\t%s\t%d", kind, e.Name(), sz))
-	}
-	return toolText(strings.Join(lines, "\n"))
-}
-
-func readText(path string) map[string]any {
-	if path == "" {
-		return toolErr("path is required")
-	}
-	st, err := os.Stat(path)
-	if err != nil {
-		return toolErr(err.Error())
-	}
-	if st.Size() > 200*1024 {
-		return toolErr(fmt.Sprintf("file too large (%d bytes); use pull_file/push_file instead", st.Size()))
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return toolErr(err.Error())
-	}
-	return toolText(string(data))
 }
 
 // --- helpers ---
