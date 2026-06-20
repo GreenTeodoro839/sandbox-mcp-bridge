@@ -57,8 +57,8 @@ var hiddenFromPhone = map[string]bool{"upload_file": true, "download_file": true
 // returned in tools/list, replacing the backend's same-named upload_file/download_file.
 func localTools() []json.RawMessage {
 	defs := []string{
-		`{"name":"upload_file","description":"Bring a file FROM this phone INTO the sandbox workspace, in one step. Reads local_path on the phone and streams the bytes to the sandbox at dest.","inputSchema":{"type":"object","properties":{"local_path":{"type":"string","description":"Absolute path of the file ON THIS PHONE, e.g. /sdcard/Download/x.zip."},"sandbox":{"type":"string","description":"Name of the target sandbox (same name used with exec/run_background)."},"dest":{"type":"string","description":"Destination in the sandbox workspace, a RELATIVE name e.g. \"input.zip\" or \"data/in.csv\" -- NOT /tmp/... (the workspace is /workspace, so \"/tmp/x\" would land at /workspace/tmp/x)."}},"required":["local_path","sandbox","dest"]}}`,
-		`{"name":"download_file","description":"Get a file OUT of the sandbox workspace (src). If local_path is given, the file is SAVED to that path on this phone; if local_path is omitted, returns a one-time download LINK to give the user.","inputSchema":{"type":"object","properties":{"sandbox":{"type":"string","description":"Name of the source sandbox."},"src":{"type":"string","description":"Path of the file in the sandbox workspace, e.g. \"out/result.csv\"."},"local_path":{"type":"string","description":"Optional. Absolute path ON THIS PHONE to save to, e.g. /sdcard/Download/result.csv. Omit to get a browser download link instead."}},"required":["sandbox","src"]}}`,
+		`{"name":"upload_file","description":"Bring a file FROM this phone INTO the sandbox, in one step. src = the file on the phone (source); dest = where it lands in the sandbox workspace (destination).","inputSchema":{"type":"object","properties":{"sandbox":{"type":"string","description":"Name of the target sandbox (same name used with exec/run_background)."},"src":{"type":"string","description":"Absolute path of the file ON THIS PHONE, e.g. /sdcard/Download/x.zip."},"dest":{"type":"string","description":"Destination in the sandbox workspace, a RELATIVE name e.g. \"input.zip\" or \"data/in.csv\" -- NOT /tmp/... (the workspace is /workspace, so \"/tmp/x\" would land at /workspace/tmp/x)."}},"required":["sandbox","src","dest"]}}`,
+		`{"name":"download_file","description":"Get a file OUT of the sandbox, in one step. src = the file in the sandbox workspace (source). dest = OPTIONAL absolute path ON THIS PHONE to save it to (destination); if you give dest the file is SAVED there, if you omit dest a one-time download LINK is returned for the user.","inputSchema":{"type":"object","properties":{"sandbox":{"type":"string","description":"Name of the source sandbox."},"src":{"type":"string","description":"Path of the file in the sandbox workspace, e.g. \"out/result.csv\"."},"dest":{"type":"string","description":"Optional. Absolute path ON THIS PHONE to save the file to, e.g. /sdcard/Download/result.csv. Omit to get a browser download link instead."}},"required":["sandbox","src"]}}`,
 	}
 	out := make([]json.RawMessage, len(defs))
 	for i, d := range defs {
@@ -364,20 +364,20 @@ func extractJSON(body []byte) []byte {
 func runLocalTool(ctx context.Context, name string, args map[string]any) map[string]any {
 	switch name {
 	case "upload_file":
-		return uploadFile(ctx, str(args, "local_path"), str(args, "sandbox"), str(args, "dest"))
+		return uploadFile(ctx, str(args, "src"), str(args, "sandbox"), str(args, "dest"))
 	case "download_file":
-		return downloadFile(ctx, str(args, "sandbox"), str(args, "src"), str(args, "local_path"))
+		return downloadFile(ctx, str(args, "sandbox"), str(args, "src"), str(args, "dest"))
 	}
 	return toolErr("unknown tool: " + name)
 }
 
-// uploadFile reads a file by path from the phone and streams it into the sandbox
-// workspace -- the phone-side replacement for the backend's URL-mode upload_file.
-func uploadFile(ctx context.Context, localPath, sandbox, dest string) map[string]any {
-	if localPath == "" || sandbox == "" || dest == "" {
-		return toolErr("local_path, sandbox and dest are required")
+// uploadFile reads a file by path from the phone (src) and streams it into the sandbox
+// workspace at dest -- the phone-side replacement for the backend's URL-mode upload_file.
+func uploadFile(ctx context.Context, src, sandbox, dest string) map[string]any {
+	if src == "" || sandbox == "" || dest == "" {
+		return toolErr("src, sandbox and dest are required")
 	}
-	f, err := os.Open(localPath)
+	f, err := os.Open(src)
 	if err != nil {
 		return toolErr("open: " + err.Error())
 	}
@@ -407,17 +407,17 @@ func uploadFile(ctx context.Context, localPath, sandbox, dest string) map[string
 	if st != nil {
 		size = st.Size()
 	}
-	return toolText(fmt.Sprintf("uploaded %s (%d bytes) -> sandbox %s:%s", localPath, size, sandbox, dest))
+	return toolText(fmt.Sprintf("uploaded %s (%d bytes) -> sandbox %s:%s", src, size, sandbox, dest))
 }
 
-// downloadFile gets a file out of the sandbox workspace. With local_path it SAVES the
+// downloadFile gets a file out of the sandbox workspace (src). With dest it SAVES the
 // bytes to that phone path; without it, it asks the backend's download_file for a
 // one-time link and returns that (for handing to the user).
-func downloadFile(ctx context.Context, sandbox, src, localPath string) map[string]any {
+func downloadFile(ctx context.Context, sandbox, src, dest string) map[string]any {
 	if sandbox == "" || src == "" {
 		return toolErr("sandbox and src are required")
 	}
-	if localPath == "" {
+	if dest == "" {
 		// link mode: the backend's download_file mints a one-time GET URL.
 		params, _ := json.Marshal(map[string]any{
 			"name":      "download_file",
@@ -436,7 +436,7 @@ func downloadFile(ctx context.Context, sandbox, src, localPath string) map[strin
 		}
 		return toolErr("download link: unexpected backend response")
 	}
-	// save mode: stream the bytes onto the phone at local_path.
+	// save mode: stream the bytes onto the phone at dest.
 	u := fmt.Sprintf("%s/files/pull?sandbox=%s&path=%s", piBase,
 		url.QueryEscape(sandbox), url.QueryEscape(src))
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
@@ -453,7 +453,7 @@ func downloadFile(ctx context.Context, sandbox, src, localPath string) map[strin
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return toolErr(fmt.Sprintf("download HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(b))))
 	}
-	out, err := os.Create(localPath)
+	out, err := os.Create(dest)
 	if err != nil {
 		return toolErr(err.Error())
 	}
@@ -462,7 +462,7 @@ func downloadFile(ctx context.Context, sandbox, src, localPath string) map[strin
 	if err != nil {
 		return toolErr("write: " + err.Error())
 	}
-	return toolText(fmt.Sprintf("downloaded %d bytes -> %s", n, localPath))
+	return toolText(fmt.Sprintf("downloaded %d bytes -> %s", n, dest))
 }
 
 // --- helpers ---
