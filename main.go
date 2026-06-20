@@ -242,7 +242,7 @@ func handleInitialize(ctx context.Context, w http.ResponseWriter, req rpcReq) {
 	writeResult(w, req.ID, map[string]any{
 		"protocolVersion": pi.ProtocolVersion,
 		"capabilities":    map[string]any{"tools": map[string]any{}},
-		"serverInfo":      map[string]any{"name": "sandbox-gateway", "version": "0.3.0"},
+		"serverInfo":      map[string]any{"name": "sandbox-gateway"},
 		"instructions":    pi.Instructions + fileInstructions,
 	})
 }
