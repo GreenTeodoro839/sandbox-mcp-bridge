@@ -59,6 +59,12 @@ const fileInstructions = "\n\n--- File transfer (phone <-> sandbox), handled by 
 	"/sdcard/Download/result.csv). To put a sandbox file onto phone storage use pull_file, " +
 	"NOT download_url (download_url is only for giving the USER a browser link)."
 
+// hiddenFromPhone names backend tools the gateway drops from the list shown to Miclaw:
+// upload_url hands back a signed PUT URL, but the phone has no way to PUT a local file,
+// so it is a dead end here -- push_file (a localTool) replaces it. The backend keeps
+// exposing upload_url to other clients; only Miclaw's view is trimmed.
+var hiddenFromPhone = map[string]bool{"upload_url": true}
+
 // localTools are served by this gateway itself (not proxied). Their JSON schemas are
 // returned in tools/list alongside the proxied sandbox tools.
 func localTools() []json.RawMessage {
@@ -262,7 +268,19 @@ func handleToolsList(ctx context.Context, w http.ResponseWriter, req rpcReq) {
 		Tools []json.RawMessage `json:"tools"`
 	}
 	_ = json.Unmarshal(res, &piList)
-	tools := append(piList.Tools, localTools()...) // sandbox tools first, then file tools
+	// Drop backend tools that are dead ends on the phone (see hiddenFromPhone).
+	kept := piList.Tools[:0]
+	for _, t := range piList.Tools {
+		var meta struct {
+			Name string `json:"name"`
+		}
+		_ = json.Unmarshal(t, &meta)
+		if hiddenFromPhone[meta.Name] {
+			continue
+		}
+		kept = append(kept, t)
+	}
+	tools := append(kept, localTools()...) // sandbox tools first, then file tools
 	writeResult(w, req.ID, map[string]any{"tools": tools})
 }
 
