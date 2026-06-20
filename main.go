@@ -45,12 +45,19 @@ var (
 
 const fileInstructions = "\n\n--- File transfer (phone <-> sandbox), handled by this gateway ---\n" +
 	"- push_file(local_path, sandbox, remote_path): copy a file FROM the phone INTO the " +
-	"sandbox workspace. local_path is an absolute phone path (e.g. /sdcard/Download/x.zip); " +
-	"remote_path is the destination name in the workspace (e.g. \"input.zip\").\n" +
+	"sandbox workspace in ONE step. local_path is the absolute phone path (e.g. " +
+	"/sdcard/Download/x.zip); sandbox is the target sandbox name; remote_path is the " +
+	"destination in the workspace. It streams the bytes directly -- you do NOT need " +
+	"upload_url/download_url, and the sandbox itself CANNOT read phone paths (never pass " +
+	"/sdcard/... to exec or fetch_url).\n" +
+	"  IMPORTANT: remote_path MUST be a RELATIVE name like \"input.zip\" or \"data/in.csv\", " +
+	"NOT an absolute path like \"/tmp/input.zip\". The workspace is /workspace inside the " +
+	"container; /tmp, /home, /root are SEPARATE places, so \"/tmp/input.zip\" would land at " +
+	"/workspace/tmp/input.zip -- the wrong spot. Use just \"input.zip\" so exec can find it.\n" +
 	"- pull_file(sandbox, remote_path, local_path): copy a file FROM the sandbox workspace " +
-	"back ONTO the phone.\n" +
-	"These move the bytes directly; you do NOT need upload_url/download_url for phone<->sandbox " +
-	"transfer."
+	"back ONTO the phone (remote_path follows the same relative-name rule; local_path is e.g. " +
+	"/sdcard/Download/result.csv). To put a sandbox file onto phone storage use pull_file, " +
+	"NOT download_url (download_url is only for giving the USER a browser link)."
 
 // localTools are served by this gateway itself (not proxied). Their JSON schemas are
 // returned in tools/list alongside the proxied sandbox tools.
